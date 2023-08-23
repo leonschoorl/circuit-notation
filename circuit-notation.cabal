@@ -21,7 +21,7 @@ library
     , clash-prelude >= 1.0
     , containers
     , data-default
-    , ghc (>=8.6 && <8.8) || (>=8.10 && < 9.2)
+    , ghc (>=8.6 && <8.8) || (>=8.10 && < 9.2) || (>=9.4 && < 9.6)
     , syb
     , lens
     , mtl
