@@ -15,6 +15,7 @@ Notation for describing the 'Circuit' type.
 {-# LANGUAGE DeriveTraversable          #-}
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
 {-# LANGUAGE ImplicitParams             #-}
+{-# LANGUAGE FlexibleInstances,MultiParamTypeClasses, UndecidableInstances,TypeOperators, FlexibleContexts          #-}
 {-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE RecordWildCards            #-}
@@ -41,7 +42,7 @@ import           Data.Default
 import           Data.Maybe             (fromMaybe)
 
 
-
+import Control.Monad
 
 import           System.IO.Unsafe
 import           Data.Typeable
@@ -129,7 +130,7 @@ import           Control.Monad.State
 -- syb
 import qualified Data.Generics          as SYB
 import qualified GHC.Plugins as Outputtable
-import GHC (HsTupleSort(HsUnboxedTuple))
+import GHC (HsTupleSort(HsBoxedOrConstraintTuple))
 import GHC.Types.Error (emptyMessages)
 
 -- The stages of this plugin
@@ -227,7 +228,7 @@ data CircuitState dec exp nm = CircuitState
     -- ^ @out <- circuit <- in@ statements
     , _circuitMasters :: PortDescription nm
     -- ^ ports bound at the first lambda of a circuit
-    , _portVarTypes :: Map GHC.FastString (SrcSpan, LHsType GhcPs)
+    , _portVarTypes :: Map GHC.NonDetFastString (SrcSpan, LHsType GhcPs)
     -- ^ types of single variable ports
     , _portTypes :: [(LHsType GhcPs, PortDescription nm)]
     -- ^ type of more 'complicated' things (very far from vigorous)
@@ -241,7 +242,10 @@ L.makeLenses 'CircuitState
 
 -- | The monad used when running a single circuit.
 newtype CircuitM a = CircuitM (StateT (CircuitState (LHsBind GhcPs) (LHsExpr GhcPs) PortName) GHC.Hsc a)
-  deriving (Functor, Applicative, Monad, MonadIO) --, MonadState (CircuitState (XRec GhcPs (HsBindLR GhcPs GhcPs)) (XRec GhcPs (HsExpr GhcPs)) PortName))
+  deriving (Functor, Applicative, Monad, MonadIO) -- , MonadState (CircuitState (LHsBind GhcPs) (LHsExpr GhcPs) PortName))
+
+instance (a ~ (LHsBind GhcPs), b ~ (LHsExpr GhcPs)) => MonadState (CircuitState a b PortName) CircuitM where
+  state = CircuitM . state
 
 instance GHC.HasDynFlags CircuitM where
   getDynFlags = (CircuitM . lift) GHC.getDynFlags
@@ -269,7 +273,7 @@ runCircuitM (CircuitM m) = do
 errM :: SrcSpan -> String -> CircuitM ()
 errM loc msg = do
   let
-    errMsg = Err.mkLocMessage Err.MCFatal loc (Outputable.text msg)
+    errMsg = Err.mkPlainError [] $ Err.mkLocMessage Err.MCFatal loc (Outputable.text msg)
   cErrors %= consBag (Err.mkErrorMsgEnvelope loc Outputtable.reallyAlwaysQualify (GHC.ghcUnknownMessage errMsg))
 
 -- ghc helpers ---------------------------------------------------------
@@ -304,7 +308,7 @@ tildeP loc lpat = reLocA $ L loc (LazyPat noAnn lpat)
 
 tupT :: p ~ GhcPs => [LHsType p] -> LHsType p
 tupT [ty] = ty
-tupT tys = noLocA $ HsTupleTy noAnn HsUnboxedTuple tys
+tupT tys = noLocA $ HsTupleTy noAnn HsBoxedOrConstraintTuple tys
 
 vecT :: p ~ GhcPs => SrcSpan -> [LHsType p] -> LHsType p
 vecT s [] = reLocA $ L s $ HsParTy noAnn (conT s (thName ''Vec) `appTy` tyNum s 0 `appTy` (varT s (genLocName s "vec")))
@@ -365,11 +369,11 @@ portTypeSigM = \case
   Tuple ps -> tupT <$> mapM portTypeSigM ps
   Vec s ps -> vecT s <$> mapM portTypeSigM ps
   Ref (PortName loc fs) -> do
-    L.use (portVarTypes . L.at fs) <&> \case
+    L.use (portVarTypes . L.at (GHC.NonDetFastString fs)) <&> \case
       Nothing -> varT loc (GHC.unpackFS fs <> "Ty")
       Just (_sigLoc, sig) -> sig
   PortErr loc msgdoc -> do
-    let errMsg = Outputable.text "portTypeSig" Outputtable.$+$ msgdoc
+    let errMsg = Err.mkPlainError [] $ Outputable.text "portTypeSig" Outputtable.$+$ msgdoc
     dflags <- GHC.getDynFlags
     unsafePerformIO . Outputtable.throwOneError $ Err.mkErrorMsgEnvelope loc Outputtable.reallyAlwaysQualify (GHC.ghcUnknownMessage errMsg)
     --  Err.mkLocMessage Err.MCFatal loc $ Outputable.text "portTypeSig" Outputtable.$+$ msgdoc
@@ -394,13 +398,16 @@ genLocName (GHC.RealSrcSpan rss _) prefix =
 genLocName _ prefix = prefix
 
 -- | Extract a simple lambda into inputs and body.
-simpleLambda :: forall p . HsExpr p -> ([LPat p], LHsExpr p)
-simpleLambda expr = (matchPats, body)
- where
-  HsLam _ (MG _x alts _origin) = expr
-  [(unXRec @p -> Match _matchX _matchContext matchPats matchGr)] = unXRec @p alts
-  GRHSs _grX grHss _grLocalBinds = matchGr
-  [unXRec @p -> (GRHS _ _ body)] = grHss
+simpleLambda :: forall p . (UnXRec (GhcPass p), OutputableBndrId p) => HsExpr (GhcPass p) -> Maybe ([LPat (GhcPass p)], LHsExpr (GhcPass p))
+simpleLambda expr = case expr of
+  HsLam _ (MG _x alts _origin) ->
+    let
+      [(unXRec @(GhcPass p) -> Match _matchX _matchContext matchPats matchGr)] = unXRec @(GhcPass p) alts
+      GRHSs _grX grHss _grLocalBinds = matchGr
+      [unXRec @(GhcPass p) -> (GRHS _ _ body)] = grHss
+    in Just (matchPats, body)
+  HsLam _ (XMatchGroup _) -> error "simpleLambda got HsLam with XMatchGroup" -- TODO ?
+  _ -> Nothing
 
 -- | Create a simple let binding.
 letE
@@ -463,7 +470,7 @@ parseCircuit = \case
   L _ (HsPar _ _ lexp _) -> parseCircuit lexp
 
   -- a lambda to match the slave ports
-  L _ (simpleLambda -> ([matchPats], body)) -> do
+  L _ (simpleLambda -> (Just ([matchPats], body))) -> do
     circuitSlaves .= bindSlave matchPats
     circuitBody body
 
@@ -569,8 +576,8 @@ bindSlave (reLoc -> L loc expr) = case expr of
   ListPat _ pats -> Vec loc (map bindSlave pats)
   pat ->
     PortErr loc
-            (Err.mkLocMessageAnn
-              Nothing
+            (Err.mkLocMessage
+              -- Nothing
               Err.MCFatal
               loc
               (Outputable.text $ "Unhandled pattern " <> show (Data.toConstr pat))
@@ -604,8 +611,8 @@ bindMaster (reLoc -> L loc expr) = case expr of
   -- OpApp _xapp (L _ circuitVar) (L _ infixVar) appR -> k
 
   _ -> PortErr loc
-    (Err.mkLocMessageAnn
-      Nothing
+    (Err.mkLocMessage
+      -- Nothing
       Err.MCFatal
       loc
       (Outputable.text $ "Unhandled expression " <> show (Data.toConstr expr))
@@ -640,7 +647,7 @@ bodyBinding mInput lexpr@(L loc expr) = do
     _ -> case mInput of
       Nothing -> errM loc "standalone expressions are not allowed (are Arrows enabled?)"
       Just input -> circuitBinds <>= [Binding
-        { bCircuit = lexpr
+        { bCircuit = reLocA lexpr
         , bOut     = Tuple []
         , bIn      = input
         }]
@@ -661,9 +668,9 @@ checkCircuit = do
       f Master (PortName srcLoc portName) = (portName, ([], [srcLoc]))
       bindingNames = \b -> portNames Master (bOut b) <> portNames Slave (bIn b)
       topNames = portNames Slave slaves <> portNames Master masters
-      nameMap = Map.fromListWith mappend $ topNames <> concatMap bindingNames binds
+      nameMap = Map.fromListWith mappend $ map (\(k,v) -> (GHC.NonDetFastString k, v)) $ topNames <> concatMap bindingNames binds
 
-  L.iforM_ nameMap \name occ ->
+  L.iforM_ nameMap \(GHC.NonDetFastString name) occ ->
     case occ of
       ([_], [_]) -> pure ()
       (ss, ms) -> do
@@ -685,7 +692,7 @@ bindWithSuffix dflags suffix = \case
   Vec s ps -> vecP s $ fmap (bindWithSuffix dflags suffix) ps
   Ref (PortName loc fs) -> varP loc (GHC.unpackFS fs <> suffix)
   PortErr loc msgdoc -> do
-    let errMsg = Outputable.text "Unhandled bind" Outputtable.$+$ msgdoc
+    let errMsg = Err.mkPlainError [] $ Outputable.text "Unhandled bind" Outputtable.$+$ msgdoc
     unsafePerformIO . Outputtable.throwOneError $ Err.mkErrorMsgEnvelope loc Outputtable.reallyAlwaysQualify (GHC.ghcUnknownMessage errMsg)
 
   Lazy loc p -> tildeP loc $ bindWithSuffix dflags suffix p
@@ -813,7 +820,7 @@ gatherTypes
 gatherTypes = L.traverseOf_ L.cosmos addTypes
   where
     addTypes = \case
-      PortType ty (Ref (PortName loc fs)) -> portVarTypes . L.at fs ?= (loc, ty)
+      PortType ty (Ref (PortName loc fs)) -> portVarTypes . L.at (GHC.NonDetFastString fs) ?= (loc, ty)
       PortType ty p -> portTypes <>= [(ty, p)]
       _             -> pure ()
 
@@ -832,18 +839,18 @@ circuitQQExpM = do
 
   dflags <- GHC.getDynFlags
   binds <- L.use circuitBinds
-  lets <- L.use circuitLets
+  lets <- L.use circuitLets :: CircuitM [GenLocated SrcSpanAnnA (HsBindLR GhcPs GhcPs)]
   letTypes <- L.use circuitTypes
-  slaves <- L.use circuitSlaves
-  masters <- L.use circuitMasters
+  slaves <- L.use circuitSlaves :: CircuitM (PortDescription PortName)
+  masters <- L.use circuitMasters :: CircuitM (PortDescription PortName)
 
   -- Construction of the circuit expression
-  let decs = lets ++ imap (\i -> noLoc . decFromBinding dflags i) binds
+  let decs = lets ++ imap (\i -> noLocA . decFromBinding dflags i) binds
   let pats = bindOutputs dflags Fwd masters slaves
       res  = createInputs Bwd slaves masters
 
       body :: LHsExpr GhcPs
-      body = letE noSrcSpan letTypes (fmap reLocA decs) res
+      body = letE noSrcSpan letTypes ({- fmap reLocA -} decs) res
 
   -- see [inference-helper]
   mapM_
@@ -933,7 +940,7 @@ completeUnderscores = do
       addDef suffix = \case
         Ref (PortName loc (unpackFS -> name@('_':_))) -> do
           let bind = patBind (varP loc (name <> suffix)) (varE loc (thName 'def))
-          circuitLets <>= [L loc bind]
+          circuitLets <>= fmap reLocA [L loc bind :: GenLocated SrcSpan (HsBind GhcPs)]
 
         _ -> pure ()
       addBind :: Binding exp PortName -> CircuitM ()
@@ -948,7 +955,7 @@ completeUnderscores = do
 transform
     :: (?nms :: ExternalNames)
     => Bool
-#if __GLASGOW_HASKELL__ >= 900
+#if __GLASGOW_HASKELL__ >= 900 && __GLASGOW_HASKELL__ < 906
     -> GHC.Located HsModule
     -> GHC.Hsc (GHC.Located HsModule)
 #else
@@ -1013,7 +1020,7 @@ pluginImpl cliOptions _modSummary (Outputtable.ParsedResult m _)  = do
       []        -> pure False
       ["debug"] -> pure True
       _ -> do
-        let errMsg = Outputable.text $ "CircuitNotation: unknown cli options " <> show cliOptions
+        let errMsg = Err.mkPlainError [] $ Outputable.text $ "CircuitNotation: unknown cli options " <> show cliOptions
         liftIO . Outputtable.throwOneError $ Err.mkErrorMsgEnvelope noSrcSpan Outputtable.reallyAlwaysQualify (GHC.ghcUnknownMessage errMsg)
     hpm_module' <- do
       transform debug (GHC.hpm_module m)
